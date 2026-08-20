@@ -114,4 +114,23 @@ Cách khắc phục (chọn 1 trong 3):
 Mỗi nhóm trả lời 2 câu:
 
 1. Case nào nên dùng multi-agent? Vì sao?
+
+   Khi câu hỏi cần tổng hợp thông tin từ nhiều nguồn bên ngoài, có yêu cầu trích dẫn
+   (citation) tường minh, và việc tách "tìm nguồn / phân tích / viết" giúp mỗi bước dùng
+   prompt chuyên biệt và dễ debug hơn khi kết quả sai. Trong benchmark ở
+   `reports/benchmark_report.md`, multi-agent luôn cho citation coverage > 0 trong khi
+   baseline luôn là rỗng — vì baseline không có bước search nên không có gì để trích dẫn.
+   Multi-agent cũng đáng dùng khi cần audit trail: `route_history` + `trace` +
+   `agent_results` cho biết chính xác agent nào tạo ra phần nào của câu trả lời.
+
 2. Case nào không nên dùng multi-agent? Vì sao?
+
+   Khi câu hỏi đơn giản, có thể trả lời tốt từ kiến thức sẵn có của LLM, hoặc khi latency/
+   cost là ưu tiên hàng đầu. Số liệu benchmark thực đo được (DeepSeek, cùng 3 query) cho
+   thấy multi-agent chậm hơn baseline 13-51 giây và tốn gấp 3-5 lần chi phí token, trong
+   khi quality score (heuristic) lại thấp hơn baseline 0.6-1.4 điểm — vì search provider
+   trong môi trường lab chỉ là mock, nên nguồn thu thập được không có giá trị thông tin
+   thực, kéo quality xuống dù citation coverage tăng. Đây là failure mode quan trọng: thêm
+   agent không tự động cải thiện chất lượng nếu bước "tìm nguồn" không có dữ liệu thật —
+   multi-agent chỉ đáng chi phí khi `SearchClient` được nối với một provider thật (Tavily/
+   Bing) thay vì mock.
