@@ -4,7 +4,7 @@ import logging
 import re
 
 from multi_agent_research_lab.agents.base import BaseAgent
-from multi_agent_research_lab.core.schemas import AgentName, AgentResult
+from multi_agent_research_lab.core.schemas import AgentName, AgentResult, CriticReview
 from multi_agent_research_lab.core.state import ResearchState
 from multi_agent_research_lab.services.llm_client import LLMClient
 
@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT = (
     "You are a strict fact-checking critic. Given a final answer and the source material it "
     "was based on, identify any claims that are unsupported, contradicted, or missing a "
-    "citation. Be brief: a short bullet list of findings, or 'No issues found.'"
+    "citation. Rate each issue's severity as low, medium, or high, and give an overall "
+    "verdict of 'pass' or 'needs_revision'."
 )
 
 _CITATION_PATTERN = re.compile(r"\[(\d+)\]")
@@ -40,16 +41,23 @@ class CriticAgent(BaseAgent):
             user_prompt = (
                 f"Final answer:\n{state.final_answer}\n\n"
                 f"Sources:\n{sources_block}\n\n"
+                f"Measured citation coverage: {citation_coverage:.0%}\n\n"
                 "Review the final answer for unsupported claims or missing citations."
             )
-            response = self._llm_client.complete(_SYSTEM_PROMPT, user_prompt)
+            review, response = self._llm_client.complete_structured(
+                _SYSTEM_PROMPT, user_prompt, CriticReview
+            )
+            review.citation_coverage = citation_coverage
 
+            state.critic_review = review
             state.agent_results.append(
                 AgentResult(
                     agent=AgentName.CRITIC,
-                    content=response.content,
+                    content=_render_review(review),
                     metadata={
                         "citation_coverage": citation_coverage,
+                        "verdict": review.verdict,
+                        "issue_count": len(review.issues),
                         "input_tokens": response.input_tokens,
                         "output_tokens": response.output_tokens,
                         "cost_usd": response.cost_usd,
@@ -57,7 +65,8 @@ class CriticAgent(BaseAgent):
                 )
             )
             state.add_trace_event(
-                "critic.complete", {"citation_coverage": citation_coverage}
+                "critic.complete",
+                {"citation_coverage": citation_coverage, "verdict": review.verdict},
             )
         except Exception as exc:  # noqa: BLE001 - convert worker failures into state errors
             message = f"critic failed: {exc}"
@@ -77,3 +86,12 @@ class CriticAgent(BaseAgent):
             return 0.0
         cited = sum(1 for s in sentences if _CITATION_PATTERN.search(s))
         return cited / len(sentences)
+
+
+def _render_review(review: CriticReview) -> str:
+    if not review.issues:
+        return f"Verdict: {review.verdict}. No issues found."
+    lines = [f"Verdict: {review.verdict}."]
+    for issue in review.issues:
+        lines.append(f"- [{issue.severity}] {issue.description}")
+    return "\n".join(lines)

@@ -7,7 +7,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from multi_agent_research_lab.core.schemas import AgentResult, ResearchQuery, SourceDocument
+from multi_agent_research_lab.core.schemas import (
+    AgentResult,
+    AnalysisResult,
+    CriticReview,
+    ResearchQuery,
+    SourceDocument,
+)
 
 
 class ResearchState(BaseModel):
@@ -20,7 +26,9 @@ class ResearchState(BaseModel):
     sources: list[SourceDocument] = Field(default_factory=list)
     research_notes: str | None = None
     analysis_notes: str | None = None
+    analysis: AnalysisResult | None = None
     final_answer: str | None = None
+    critic_review: CriticReview | None = None
 
     agent_results: list[AgentResult] = Field(default_factory=list)
     trace: list[dict[str, Any]] = Field(default_factory=list)

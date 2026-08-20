@@ -3,14 +3,19 @@
 Production note: agents should depend on this interface instead of importing an SDK directly.
 """
 
+import json
 import logging
 from dataclasses import dataclass
+from typing import Any, TypeVar
 
+from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from multi_agent_research_lab.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 # Rough public pricing for gpt-4o-mini class models (USD per 1K tokens). Used only to
 # produce an *estimate* for benchmarking, not for billing.
@@ -78,8 +83,51 @@ class LLMClient:
         if self._client is None:
             return self._mock_complete(system_prompt, user_prompt)
 
+        return self._call_provider(system_prompt, user_prompt)
+
+    def complete_structured(
+        self, system_prompt: str, user_prompt: str, schema: type[SchemaT]
+    ) -> tuple[SchemaT, LLMResponse]:
+        """Return a model completion validated against a Pydantic schema (JSON mode).
+
+        Retries on both transient provider errors and JSON/schema validation failures,
+        appending the validation error to the prompt on retry so the model can self-correct.
+        """
+
+        if self._client is None:
+            response = self._mock_complete(system_prompt, user_prompt)
+            return self._mock_structured(schema), response
+
+        schema_prompt = (
+            f"{system_prompt}\n\n"
+            "Respond with ONLY a single valid JSON object matching this schema "
+            f"(no markdown fences, no commentary):\n{schema.model_json_schema()}"
+        )
+
+        last_error: Exception | None = None
+        for attempt in range(3):
+            prompt = user_prompt
+            if last_error is not None:
+                prompt += f"\n\nYour previous response was invalid JSON: {last_error}. Fix it."
+            response = self._call_provider(schema_prompt, prompt, json_mode=True)
+            try:
+                parsed = schema.model_validate(json.loads(response.content))
+                return parsed, response
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                logger.warning(
+                    "structured output validation failed (attempt %d): %s", attempt + 1, exc
+                )
+
+        raise LLMClientError(f"structured output validation failed after retries: {last_error}")
+
+    def _call_provider(
+        self, system_prompt: str, user_prompt: str, json_mode: bool = False
+    ) -> LLMResponse:
+        assert self._client is not None
         try:
-            response = self._client.chat.completions.create(
+            completions: Any = self._client.chat.completions
+            response = completions.create(
                 model=self._model,
                 temperature=0.2,
                 timeout=self._settings.timeout_seconds,
@@ -87,9 +135,10 @@ class LLMClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                response_format={"type": "json_object"} if json_mode else None,
             )
         except Exception as exc:  # noqa: BLE001 - normalize provider errors for retry/handling
-            raise LLMClientError(f"OpenAI completion failed: {exc}") from exc
+            raise LLMClientError(f"LLM completion failed: {exc}") from exc
 
         choice = response.choices[0]
         content = choice.message.content or ""
@@ -123,6 +172,24 @@ class LLMClient:
             output_tokens=output_tokens,
             cost_usd=self._estimate_cost(input_tokens, output_tokens),
         )
+
+    @staticmethod
+    def _mock_structured(schema: type[SchemaT]) -> SchemaT:
+        """Build a minimal valid instance of `schema` for the offline mock path."""
+
+        placeholders: dict[str, object] = {}
+        for field_name, field in schema.model_fields.items():
+            if field.is_required():
+                annotation = field.annotation
+                if annotation is float:
+                    placeholders[field_name] = 0.0
+                elif annotation is int:
+                    placeholders[field_name] = 0
+                elif annotation is str:
+                    placeholders[field_name] = "mock"
+                else:
+                    placeholders[field_name] = []
+        return schema.model_validate(placeholders)
 
     @staticmethod
     def _estimate_cost(input_tokens: int | None, output_tokens: int | None) -> float | None:

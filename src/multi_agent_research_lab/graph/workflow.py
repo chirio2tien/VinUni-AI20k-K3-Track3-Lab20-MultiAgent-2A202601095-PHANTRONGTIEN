@@ -1,6 +1,8 @@
 """LangGraph workflow for the multi-agent research pipeline."""
 
 import logging
+import uuid
+from collections.abc import Iterator
 from typing import Any
 
 from multi_agent_research_lab.agents.analyst import AnalystAgent
@@ -21,6 +23,7 @@ from multi_agent_research_lab.observability.tracing import trace_span
 logger = logging.getLogger(__name__)
 
 try:
+    from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, StateGraph
 
     _HAS_LANGGRAPH = True
@@ -44,7 +47,8 @@ class MultiAgentWorkflow:
         self.analyst = AnalystAgent()
         self.writer = WriterAgent()
         self.critic = CriticAgent()
-        self._graph = None
+        self._graph: Any | None = None
+        self._checkpointer: object | None = None
         self._agents = {
             "supervisor": self.supervisor,
             "researcher": self.researcher,
@@ -88,28 +92,60 @@ class MultiAgentWorkflow:
         for worker in ("researcher", "analyst", "writer", "critic"):
             builder.add_edge(worker, "supervisor")
 
-        self._graph = builder.compile()
+        self._checkpointer = MemorySaver()
+        self._graph = builder.compile(checkpointer=self._checkpointer)
         return self._graph
 
-    def run(self, state: ResearchState) -> ResearchState:
+    def run(self, state: ResearchState, thread_id: str | None = None) -> ResearchState:
         """Execute the graph (or fallback loop) and return the final state."""
+
+        final_state = state
+        for emitted in self.run_streaming(state, thread_id=thread_id):
+            final_state = emitted
+        return final_state
+
+    def run_streaming(
+        self, state: ResearchState, thread_id: str | None = None
+    ) -> Iterator[ResearchState]:
+        """Execute the workflow, yielding the state after every node completes.
+
+        Lets a caller (e.g. the CLI) render progress in real time instead of blocking
+        until the whole pipeline finishes. Uses LangGraph's `.stream()` API when available,
+        falling back to a plain-Python loop that yields the same way otherwise.
+
+        `thread_id` identifies the run in the checkpointer: passing the same id for a
+        retry resumes from the last completed node instead of starting over (LangGraph
+        path only; the fallback loop always restarts from the given `state`).
+        """
 
         if self._graph is None:
             self.build()
 
         if self._graph is not None:
-            result = self._graph.invoke(state, config={"recursion_limit": 100})
-            return result if isinstance(result, ResearchState) else ResearchState(**result)
+            yield from self._stream_langgraph(state, thread_id or str(uuid.uuid4()))
+        else:
+            yield from self._stream_fallback_loop(state)
 
-        return self._run_fallback_loop(state)
+    def _stream_langgraph(self, state: ResearchState, thread_id: str) -> Iterator[ResearchState]:
+        assert self._graph is not None
+        config = {"recursion_limit": 100, "configurable": {"thread_id": thread_id}}
+        for chunk in self._graph.stream(state, config=config):
+            node_output = next(iter(chunk.values()))
+            if isinstance(node_output, ResearchState):
+                state = node_output
+            else:
+                state = ResearchState(**node_output)
+            yield state
 
-    def _run_fallback_loop(self, state: ResearchState) -> ResearchState:
+    def _stream_fallback_loop(self, state: ResearchState) -> Iterator[ResearchState]:
         """Plain-Python state machine used when `langgraph` isn't installed."""
 
         worker_routes = {ROUTE_RESEARCHER, ROUTE_ANALYST, ROUTE_WRITER, ROUTE_CRITIC}
         while True:
             state = self._run_node("supervisor", state)
+            yield state
             route = state.route_history[-1] if state.route_history else ROUTE_DONE
             if route == ROUTE_DONE or route not in worker_routes:
-                return state
+                return
             state = self._run_node(route, state)
+            yield state

@@ -1,8 +1,20 @@
-# Lab 20: Multi-Agent Research System Starter
+# Lab 20: Multi-Agent Research System
 
-Starter repo cho bài lab **Multi-Agent Systems**: xây dựng hệ thống nghiên cứu gồm **Supervisor + Researcher + Analyst + Writer** và benchmark với single-agent baseline.
+Hệ thống nghiên cứu multi-agent hoàn chỉnh: **Supervisor + Researcher + Analyst + Writer +
+Critic**, chạy trên LangGraph, benchmark với single-agent baseline. Bắt đầu từ starter
+skeleton của bài lab, mọi `TODO(student)` đã được triển khai đầy đủ và mở rộng thêm:
 
-> Mục tiêu của repo này là cung cấp **production-grade skeleton** để học viên phát triển code cá nhân. Các phần logic quan trọng được để ở dạng `TODO` để học viên tự triển khai.
+- **LLM provider:** OpenAI hoặc **DeepSeek** (OpenAI-compatible API), chọn qua `LLM_PROVIDER`.
+- **Search:** Tavily thật, fallback mock nếu không có key.
+- **Structured output:** Analyst/Critic trả JSON có schema (Pydantic), tự retry khi model
+  trả sai định dạng.
+- **Parallel research:** Researcher chia query thành 3 sub-query, search song song.
+- **Streaming CLI:** `multi-agent` in tiến trình theo từng bước thay vì đợi xong mới in.
+- **Checkpointing:** LangGraph `MemorySaver`, resume được nếu crash giữa chừng.
+- **LLM-as-judge:** benchmark chấm điểm câu trả lời bằng một LLM call độc lập, song song
+  với heuristic quality score.
+- **HTML dashboard:** `make benchmark` sinh cả `benchmark_report.md` và
+  `benchmark_report.html` (biểu đồ so sánh, theme-aware, tự chứa).
 
 ## Learning outcomes
 
@@ -65,14 +77,21 @@ cp .env.example .env
 
 ### 2. Cấu hình API keys
 
-Mở `.env` và điền key cần thiết.
+Mở `.env` và điền key cần thiết. `LLM_PROVIDER` chọn `openai` hoặc `deepseek`.
 
 ```bash
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=...
+# hoặc
 OPENAI_API_KEY=...
+
 # optional
 LANGSMITH_API_KEY=...
 TAVILY_API_KEY=...
 ```
+
+Không có key nào? Mọi client (`LLMClient`, `SearchClient`) tự fallback sang chế độ mock
+deterministic — toàn bộ workflow vẫn chạy được end-to-end để test/CI.
 
 ### 3. Chạy smoke test
 
@@ -81,23 +100,33 @@ make test
 python -m multi_agent_research_lab.cli --help
 ```
 
-### 4. Chạy baseline skeleton
+### 4. Chạy baseline
 
 ```bash
 python -m multi_agent_research_lab.cli baseline \
   --query "Research GraphRAG state-of-the-art and write a 500-word summary"
 ```
 
-Lệnh này chỉ chạy khung baseline tối giản. Học viên cần tự triển khai logic LLM thực tế trong `src/multi_agent_research_lab/services/llm_client.py`.
-
-### 5. Chạy multi-agent skeleton
+### 5. Chạy multi-agent workflow
 
 ```bash
 python -m multi_agent_research_lab.cli multi-agent \
   --query "Research GraphRAG state-of-the-art and write a 500-word summary"
 ```
 
-Mặc định lệnh sẽ báo các `TODO` cần làm. Đây là chủ đích của starter repo.
+In tiến trình theo từng bước (Supervisor → Researcher → Analyst → Writer → Critic), sau đó
+in `ResearchState` đầy đủ dạng JSON.
+
+### 6. Chạy benchmark
+
+```bash
+python -m multi_agent_research_lab.cli benchmark
+# hoặc
+make benchmark
+```
+
+Chạy baseline + multi-agent trên các query trong `configs/lab_default.yaml`, ghi
+`reports/benchmark_report.md` và `reports/benchmark_report.html`.
 
 ## Milestones trong 2 giờ lab
 
@@ -120,32 +149,25 @@ Mặc định lệnh sẽ báo các `TODO` cần làm. Đây là chủ đích c�
 - Không để agent chạy vô hạn: dùng `max_iterations`, `timeout_seconds`.
 - Có benchmark report thay vì chỉ demo output đẹp.
 
-## TODO chính cho học viên
+## Trạng thái implementation
 
-Tìm trong code các marker:
+Không còn `TODO(student)` nào trong `src/`. Xem `docs/design_template.md` để biết chi
+tiết thiết kế (agent roles, shared state, routing policy, guardrails, benchmark plan) và
+`docs/lab_guide.md` cho exit ticket đã trả lời dựa trên số liệu benchmark thật.
 
 ```bash
-grep -R "TODO(student)" -n src tests docs
+make lint       # ruff — sạch
+make test       # pytest — 9/9 pass
+mypy src        # strict — sạch
 ```
-
-Các phần học viên cần tự làm:
-
-1. Implement LLM client.
-2. Implement web/search client hoặc mock search source.
-3. Implement routing decision trong Supervisor.
-4. Implement từng worker agent.
-5. Build LangGraph workflow.
-6. Thêm tracing provider thật: LangSmith, Langfuse hoặc OpenTelemetry.
-7. Viết benchmark report.
 
 ## Deliverables
 
-Học viên nộp:
-
-1. GitHub repo cá nhân.
-2. Screenshot trace hoặc link trace.
-3. `reports/benchmark_report.md` so sánh single vs multi-agent.
-4. Một đoạn giải thích failure mode và cách fix.
+1. GitHub repo (repo này).
+2. Trace: `LANGSMITH_API_KEY` (tùy chọn) để có trace UI thật; luôn có `state.trace` cục bộ.
+3. `reports/benchmark_report.md` + `reports/benchmark_report.html` — so sánh single vs
+   multi-agent bằng latency/cost/quality heuristic/judge score/citation coverage.
+4. Failure mode + cách fix: xem exit ticket trong `docs/lab_guide.md`.
 
 ## References
 

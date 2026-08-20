@@ -50,6 +50,10 @@ target-version = "py311"
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = []
 
+[tool.ruff.lint.per-file-ignores]
+# HTML/CSS template literals are not meaningfully wrapped by Python's line-length rule.
+"src/multi_agent_research_lab/evaluation/report.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

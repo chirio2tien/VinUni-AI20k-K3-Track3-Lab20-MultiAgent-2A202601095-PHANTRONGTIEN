@@ -27,10 +27,10 @@ trong `reports/benchmark_report.md`.
 | Agent | Responsibility | Input | Output | Failure mode |
 |---|---|---|---|---|
 | Supervisor | Quyết định route tiếp theo dựa trên state hiện có; enforce `max_iterations` | `ResearchState` | `route_history` mới | Loop vô hạn nếu thiếu stop condition → chặn bằng `max_iterations` + fallback sau 2 lần route giống nhau kèm lỗi |
-| Researcher | Tìm nguồn (`SearchClient`) và tóm tắt thành `research_notes` | `request.query` | `sources`, `research_notes` | Search provider fail → bắt exception, ghi vào `state.errors`, supervisor route tiếp thay vì crash |
-| Analyst | Trích xuất luận điểm chính, so sánh quan điểm, đánh giá bằng chứng yếu | `research_notes` | `analysis_notes` | Thiếu `research_notes` → raise `ValueError` bắt ở trong, ghi lỗi vào state |
+| Researcher | Chia query thành 3 sub-query, search song song (`ThreadPoolExecutor`), gộp + tóm tắt thành `research_notes` | `request.query` | `sources`, `research_notes` | Search provider fail → bắt exception, ghi vào `state.errors`, supervisor route tiếp thay vì crash |
+| Analyst | Trích xuất key claims có structured schema (`AnalysisResult`: claim + supporting sources + confidence), so sánh quan điểm, flag bằng chứng yếu | `research_notes` | `analysis` (structured), `analysis_notes` (render text) | Thiếu `research_notes` → raise `ValueError` bắt ở trong, ghi lỗi vào state; JSON không hợp lệ → tự retry với lỗi kèm trong prompt |
 | Writer | Tổng hợp `final_answer` có trích dẫn `[n]` trỏ về `sources` | `research_notes`, `analysis_notes`, `sources` | `final_answer` | Thiếu `analysis_notes` → tương tự Analyst |
-| Critic | Fact-check câu trả lời cuối, đo citation coverage | `final_answer`, `sources` | `AgentResult` ghi vào `agent_results`, không sửa `final_answer` | Không có final_answer → bỏ qua, ghi lỗi |
+| Critic | Fact-check với structured schema (`CriticReview`: issues có severity + verdict pass/needs_revision), đo citation coverage | `final_answer`, `sources` | `critic_review` (structured), `AgentResult` | Không có final_answer → bỏ qua, ghi lỗi |
 
 ## Shared state
 
@@ -83,8 +83,14 @@ nào đã có/thiếu trong state — rẻ, nhanh, và dễ test (xem `tests/tes
   - Supervisor: agent lặp lại thất bại 2 lần liên tiếp → route sang bước kế tiếp thay vì
     thử lại vô hạn.
 - **Validation:** Toàn bộ input/output chính (`ResearchQuery`, `AgentResult`,
-  `SourceDocument`, `BenchmarkMetrics`) đều là Pydantic model — sai kiểu dữ liệu bị chặn
-  ngay ở boundary (CLI parse, agent output).
+  `SourceDocument`, `BenchmarkMetrics`, `AnalysisResult`, `CriticReview`, `JudgeVerdict`)
+  đều là Pydantic model. Analyst/Critic dùng structured output (JSON mode) validate theo
+  schema — nếu model trả JSON sai, lỗi validation được đưa lại vào prompt để model tự sửa
+  (tối đa 3 lần) thay vì crash hoặc âm thầm nhận dữ liệu sai định dạng.
+- **Checkpointing:** Khi có `langgraph`, mỗi lần chạy `multi-agent` compile graph với
+  `MemorySaver` checkpointer và một `thread_id` riêng. Nếu tiến trình crash giữa chừng,
+  gọi lại `workflow.run(state, thread_id=<cùng id>)` sẽ resume từ node cuối đã hoàn thành
+  thay vì chạy lại từ đầu (tốn thêm LLM call).
 
 ## Benchmark plan
 
@@ -99,13 +105,19 @@ Metric đo (`evaluation/benchmark.py`):
 | Metric | Cách đo |
 |---|---|
 | Latency | wall-clock giữa lúc gọi runner và lúc trả về state |
-| Cost | tổng `cost_usd` ước tính từ token usage của mọi `AgentResult` |
-| Quality | heuristic 0-10: độ dài câu trả lời + citation coverage + số lỗi non-fatal |
+| Cost | tổng `cost_usd` ước tính từ token usage của mọi `AgentResult`, cộng cả chi phí gọi judge |
+| Quality (heuristic) | 0-10 rẻ, không tốn LLM call: độ dài câu trả lời + citation coverage + số lỗi non-fatal |
+| Judge score | 0-10 từ một LLM call riêng chấm điểm độc lập (accuracy, completeness, clarity, citations) — gần với cách chấm trong `docs/peer_review_rubric.md` hơn heuristic |
 | Citation coverage | tỉ lệ câu trong `final_answer` có `[n]` trỏ về nguồn |
 | Failure rate | 1.0 nếu runner crash hoặc không sinh được `final_answer`, ngược lại 0.0 |
 
-Expected outcome: multi-agent chậm hơn và tốn hơn baseline (nhiều LLM call hơn), nhưng
-citation coverage cao hơn hẳn (baseline không có bước search nên coverage luôn rỗng).
-Quality score có thể ngang hoặc thấp hơn baseline khi search provider chỉ là mock — đây là
-một failure mode thực tế cần ghi nhận: multi-agent chỉ thắng khi nguồn tìm được có chất
-lượng, nếu không nó chỉ thêm chi phí mà không thêm giá trị.
+`make benchmark` (hoặc `malab benchmark`) sinh cả `reports/benchmark_report.md` và
+`reports/benchmark_report.html` — bản HTML có biểu đồ so sánh trực quan, tự chứa (không
+cần mạng để mở), theme-aware (light/dark theo hệ thống).
+
+Kết quả đo thật (DeepSeek + Tavily search thật, không mock) trên 3 query benchmark cho
+thấy: multi-agent chậm hơn baseline 15-80s và tốn gấp 2-5 lần chi phí token, nhưng citation
+coverage đạt 47-69% (baseline luôn 0% vì không có bước search) và judge score sát nút hoặc
+nhỉnh hơn baseline một chút. Đây là bằng chứng thực tế cho trade-off: multi-agent trả giá
+bằng latency/cost để đổi lấy khả năng trích dẫn nguồn — giá trị đó chỉ đáng nếu người dùng
+thực sự cần kiểm chứng được câu trả lời, không phải lúc nào cũng đáng.

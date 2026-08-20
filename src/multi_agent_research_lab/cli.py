@@ -1,5 +1,6 @@
 """Command-line entrypoint for the lab starter."""
 
+import uuid
 from pathlib import Path
 from typing import Annotated
 
@@ -14,7 +15,7 @@ from multi_agent_research_lab.core.errors import StudentTodoError
 from multi_agent_research_lab.core.schemas import AgentName, AgentResult, ResearchQuery
 from multi_agent_research_lab.core.state import ResearchState
 from multi_agent_research_lab.evaluation.benchmark import run_benchmark
-from multi_agent_research_lab.evaluation.report import render_markdown_report
+from multi_agent_research_lab.evaluation.report import render_html_report, render_markdown_report
 from multi_agent_research_lab.graph.workflow import MultiAgentWorkflow
 from multi_agent_research_lab.observability.logging import configure_logging
 from multi_agent_research_lab.services.llm_client import LLMClient
@@ -69,10 +70,10 @@ def _run_baseline(query: str) -> ResearchState:
     return state
 
 
-def _run_multi_agent(query: str) -> ResearchState:
+def _run_multi_agent(query: str, thread_id: str | None = None) -> ResearchState:
     state = ResearchState(request=_parse_query(query))
     workflow = MultiAgentWorkflow()
-    return workflow.run(state)
+    return workflow.run(state, thread_id=thread_id)
 
 
 @app.command()
@@ -90,15 +91,30 @@ def baseline(
 def multi_agent(
     query: Annotated[str, typer.Option("--query", "-q", help="Research query")],
 ) -> None:
-    """Run the multi-agent workflow: Supervisor -> Researcher -> Analyst -> Writer -> Critic."""
+    """Run the multi-agent workflow: Supervisor -> Researcher -> Analyst -> Writer -> Critic.
+
+    Streams progress node-by-node (checkpointed under a fresh thread id, so a crashed run
+    could be resumed by re-invoking the workflow with the same thread id).
+    """
 
     _init()
+    thread_id = str(uuid.uuid4())
+    workflow = MultiAgentWorkflow()
+    initial_state = ResearchState(request=_parse_query(query))
+    final_state = initial_state
+
     try:
-        result = _run_multi_agent(query)
+        with console.status("Starting workflow...") as status:
+            for step_state in workflow.run_streaming(initial_state, thread_id=thread_id):
+                final_state = step_state
+                last_route = step_state.route_history[-1] if step_state.route_history else "?"
+                status.update(f"[{step_state.iteration}] last step: {last_route}")
+                console.print(f"  -> {last_route} (iteration {step_state.iteration})")
     except StudentTodoError as exc:
         console.print(Panel.fit(str(exc), title="Expected TODO", style="yellow"))
         raise typer.Exit(code=2) from exc
-    console.print(result.model_dump_json(indent=2))
+
+    console.print(final_state.model_dump_json(indent=2))
 
 
 @app.command()
@@ -125,10 +141,15 @@ def benchmark(
         _, multi_metrics = run_benchmark("multi-agent", query, _run_multi_agent)
         metrics.append(multi_metrics)
 
-    report = render_markdown_report(metrics)
     store = LocalArtifactStore()
-    path = store.write_text(output, report)
-    console.print(Panel.fit(f"Report written to {path}", title="Benchmark", style="green"))
+    md_path = store.write_text(output, render_markdown_report(metrics))
+    html_output = Path(output).with_suffix(".html").as_posix()
+    html_path = store.write_text(html_output, render_html_report(metrics))
+    console.print(
+        Panel.fit(
+            f"Reports written to {md_path} and {html_path}", title="Benchmark", style="green"
+        )
+    )
 
 
 if __name__ == "__main__":

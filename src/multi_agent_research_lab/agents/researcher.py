@@ -1,24 +1,28 @@
 """Researcher agent."""
 
 import logging
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 from multi_agent_research_lab.agents.base import BaseAgent
-from multi_agent_research_lab.core.schemas import AgentName, AgentResult
+from multi_agent_research_lab.core.schemas import AgentName, AgentResult, SourceDocument
 from multi_agent_research_lab.core.state import ResearchState
 from multi_agent_research_lab.services.llm_client import LLMClient
 from multi_agent_research_lab.services.search_client import SearchClient
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
+_SYNTHESIS_SYSTEM_PROMPT = (
     "You are a meticulous research agent. Given a user query and a list of retrieved "
     "sources, write concise research notes (bullet points) that capture the key facts. "
     "Reference sources by their index, e.g. [1], [2], so claims can be traced back."
 )
 
+_MAX_WORKERS = 3
+
 
 class ResearcherAgent(BaseAgent):
-    """Collects sources and creates concise research notes."""
+    """Collects sources (in parallel sub-searches) and creates concise research notes."""
 
     name = "researcher"
 
@@ -32,9 +36,18 @@ class ResearcherAgent(BaseAgent):
 
     def run(self, state: ResearchState) -> ResearchState:
         try:
-            sources = self._search_client.search(
-                state.request.query, max_results=state.request.max_sources
-            )
+            sub_queries = self._sub_queries(state.request.query)
+            per_query_max = max(1, state.request.max_sources // len(sub_queries))
+
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+                results = list(
+                    pool.map(
+                        lambda q: self._search_client.search(q, max_results=per_query_max),
+                        sub_queries,
+                    )
+                )
+
+            sources = _dedupe(doc for batch in results for doc in batch)
             state.sources = sources
 
             sources_block = "\n".join(
@@ -44,7 +57,7 @@ class ResearcherAgent(BaseAgent):
                 f"Query: {state.request.query}\n\nSources:\n{sources_block}\n\n"
                 "Write research notes summarizing the most relevant facts from these sources."
             )
-            response = self._llm_client.complete(_SYSTEM_PROMPT, user_prompt)
+            response = self._llm_client.complete(_SYNTHESIS_SYSTEM_PROMPT, user_prompt)
 
             state.research_notes = response.content
             state.agent_results.append(
@@ -53,6 +66,7 @@ class ResearcherAgent(BaseAgent):
                     content=response.content,
                     metadata={
                         "source_count": len(sources),
+                        "sub_query_count": len(sub_queries),
                         "input_tokens": response.input_tokens,
                         "output_tokens": response.output_tokens,
                         "cost_usd": response.cost_usd,
@@ -60,7 +74,8 @@ class ResearcherAgent(BaseAgent):
                 )
             )
             state.add_trace_event(
-                "researcher.complete", {"source_count": len(sources)}
+                "researcher.complete",
+                {"source_count": len(sources), "sub_queries": sub_queries},
             )
         except Exception as exc:  # noqa: BLE001 - convert worker failures into state errors
             message = f"researcher failed: {exc}"
@@ -69,3 +84,30 @@ class ResearcherAgent(BaseAgent):
             state.add_trace_event("researcher.error", {"error": str(exc)})
 
         return state
+
+    def _sub_queries(self, query: str) -> list[str]:
+        """Split the query into a few angles so searches can run in parallel.
+
+        Kept as a cheap, deterministic transform (no LLM call) rather than an extra
+        round-trip: the marginal quality gain from an LLM-generated decomposition rarely
+        justifies doubling latency/cost for a research step that already fans out searches.
+        """
+
+        base = query.strip().rstrip("?.")
+        return [
+            base,
+            f"{base} recent developments",
+            f"{base} limitations and trade-offs",
+        ]
+
+
+def _dedupe(docs: Iterable[SourceDocument]) -> list[SourceDocument]:
+    seen: set[str] = set()
+    unique: list[SourceDocument] = []
+    for doc in docs:
+        key = doc.url or doc.title
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(doc)
+    return unique
