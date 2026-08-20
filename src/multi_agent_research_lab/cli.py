@@ -1,5 +1,6 @@
 """Command-line entrypoint for the lab starter."""
 
+import sys
 import uuid
 from pathlib import Path
 from typing import Annotated
@@ -9,6 +10,12 @@ import yaml
 from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
+
+if sys.platform == "win32":
+    # The default Windows console codepage (cp1252) can't encode most Unicode output
+    # (diacritics, em dashes, curly quotes) that LLM responses commonly contain.
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
 
 from multi_agent_research_lab.core.config import get_settings
 from multi_agent_research_lab.core.errors import StudentTodoError
